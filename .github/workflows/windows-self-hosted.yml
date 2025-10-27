@@ -1,0 +1,192 @@
+name: Windows Self-Hosted Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: "Publish a GitHub Release with the packaged artifact"
+        type: boolean
+        default: false
+      release_tag:
+        description: "Tag name to use for the Release (only when publishing via workflow_dispatch)"
+        type: string
+        required: false
+        default: ""
+      release_name:
+        description: "Release title (optional)"
+        type: string
+        required: false
+        default: ""
+      prerelease:
+        description: "Mark the release as a prerelease (workflow_dispatch only)"
+        type: boolean
+        default: true
+      draft:
+        description: "Create the release as a draft (workflow_dispatch only)"
+        type: boolean
+        default: false
+  push:
+    branches:
+      - main
+    tags:
+      - v*
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  WindowsSelfHostedBuild:
+    name: Build Opus on Self-Hosted Windows Runner
+    runs-on: [self-hosted, windows, x64]
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+        - {
+            name: "Windows/Lib/X64/Release",
+            arch: x64,
+            build_type: Release,
+            shared: OFF
+          }
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download models
+        run: .\autogen.bat
+        shell: cmd
+
+      - name: Create build directory
+        run: mkdir build
+        shell: cmd
+
+      - name: Configure CMake (static)
+        working-directory: ./build
+        run: |
+          cmake --version
+          cmake .. -G "Visual Studio 17 2022" ^
+            -A ${{ matrix.config.arch }} ^
+            -DOPUS_BUILD_SHARED_LIBRARY=${{ matrix.config.shared }} ^
+            -DBUILD_SHARED_LIBS=${{ matrix.config.shared }} ^
+            -DOPUS_BUILD_PROGRAMS=ON ^
+            -DOPUS_BUILD_TESTING=ON ^
+            -DBUILD_TESTING=ON ^
+            -DCMAKE_BUILD_TYPE=${{ matrix.config.build_type }}
+        shell: cmd
+
+      - name: Build
+        working-directory: ./build
+        run: cmake --build . -j 2 --config ${{ matrix.config.build_type }}
+        shell: cmd
+
+      - name: Test
+        working-directory: ./build
+        run: ctest -j 2 -C ${{ matrix.config.build_type }} --output-on-failure
+        shell: cmd
+
+      # Compute safe names and a zip filename that always ends with .zip
+      - name: Compute artifact names
+        id: names
+        working-directory: ./build
+        shell: pwsh
+        env:
+          INPUT_PUBLISH: ${{ inputs.publish_release }}
+          INPUT_TAG: ${{ inputs.release_tag }}
+          REF_NAME: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          $raw = "${{ matrix.config.name }}"
+          $safe = $raw.Replace('/', '-').Replace('\', '-')
+
+          $eventName = "${env:EVENT_NAME}"
+          $publishInput = ("${env:INPUT_PUBLISH}" -eq "true") -or ("${env:INPUT_PUBLISH}" -eq "True")
+          $inputTag = "${env:INPUT_TAG}"
+          $refName = "${env:REF_NAME}"
+
+          $doPublish = $false
+          $releaseTag = ""
+          if ($eventName -eq 'workflow_dispatch' -and $publishInput) {
+            $doPublish = $true
+            if ([string]::IsNullOrWhiteSpace($inputTag)) {
+              $releaseTag = "manual-" + (Get-Date -Format 'yyyyMMdd-HHmmss')
+            } else {
+              $releaseTag = $inputTag
+            }
+            $label = $releaseTag
+          } else {
+            $label = $refName
+          }
+
+          # Make a filesystem-safe label (Windows) for filenames
+          $labelSafe = ($label -replace '[^A-Za-z0-9._-]', '-')
+          $zip = "opus-$safe-$labelSafe.zip"
+
+          "safe_name=$safe"          >> $env:GITHUB_OUTPUT
+          "label_safe=$labelSafe"    >> $env:GITHUB_OUTPUT
+          "zip_file=$zip"            >> $env:GITHUB_OUTPUT
+          "do_publish=$doPublish"    >> $env:GITHUB_OUTPUT
+          "release_tag=$releaseTag"  >> $env:GITHUB_OUTPUT
+
+      # Collect and zip artifacts
+      - name: Collect and zip artifacts
+        working-directory: ./build
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path artifacts\lib | Out-Null
+          New-Item -ItemType Directory -Force -Path artifacts\include | Out-Null
+
+          # Copy static library (built with Visual Studio generator)
+          Copy-Item -Path "${{ matrix.config.build_type }}\opus*.lib" -Destination artifacts\lib -ErrorAction Stop
+
+          # Copy public headers from source tree
+          Copy-Item -Path "..\include\*" -Destination artifacts\include -Recurse -Force
+
+          # Optional: license/readme
+          if (Test-Path ..\COPYING) { Copy-Item ..\COPYING artifacts\ -Force }
+          if (Test-Path ..\README.md) { Copy-Item ..\README.md artifacts\ -Force }
+
+          # Ensure .zip suffix and parent dir exist
+          $zip = "${{ steps.names.outputs.zip_file }}"
+          if ([System.IO.Path]::GetExtension($zip) -ne '.zip') { $zip = "$zip.zip" }
+          $parent = Split-Path -Parent $zip
+          if ($parent) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
+
+          Compress-Archive -Path "artifacts\*" -DestinationPath $zip -Force
+
+          Get-ChildItem -Recurse
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: opus-${{ steps.names.outputs.safe_name }}-${{ steps.names.outputs.label_safe }}
+          path: build/${{ steps.names.outputs.zip_file }}
+          if-no-files-found: error
+
+      # Publish a GitHub Release with the zip attached when building a tag (e.g., v1.0.0)
+      - name: Create GitHub Release and upload asset (tag push)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/${{ steps.names.outputs.zip_file }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Publish a GitHub Release from workflow_dispatch with a provided (or generated) tag
+      - name: Create GitHub Release and upload asset (manual publish)
+        if: github.event_name == 'workflow_dispatch' && steps.names.outputs.do_publish == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.names.outputs.release_tag }}
+          name: ${{ inputs.release_name }}
+          files: build/${{ steps.names.outputs.zip_file }}
+          generate_release_notes: true
+          prerelease: ${{ inputs.prerelease }}
+          draft: ${{ inputs.draft }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
