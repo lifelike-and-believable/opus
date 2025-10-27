@@ -63,7 +63,18 @@ jobs:
         run: ctest -j 2 -C ${{ matrix.config.build_type }} --output-on-failure
         shell: cmd
 
-      # Replace the non-functional "Package" step with explicit packaging
+      # Compute a safe artifact/zip name (replace / and \ with -)
+      - name: Compute artifact names
+        id: names
+        working-directory: ./build
+        shell: pwsh
+        run: |
+          $raw = "${{ matrix.config.name }}"
+          $safe = $raw.Replace('/', '-').Replace('\', '-')
+          "safe_name=$safe" >> $env:GITHUB_OUTPUT
+          "zip_file=opus-$safe.zip" >> $env:GITHUB_OUTPUT
+
+      # Collect and zip artifacts with sanitized name
       - name: Collect and zip artifacts
         working-directory: ./build
         shell: pwsh
@@ -82,8 +93,9 @@ jobs:
           if (Test-Path ..\COPYING) { Copy-Item ..\COPYING artifacts\ -Force }
           if (Test-Path ..\README.md) { Copy-Item ..\README.md artifacts\ -Force }
 
-          # Create archive at build\opus-<name>.zip
-          Compress-Archive -Path "artifacts\*" -DestinationPath "opus-${{ matrix.config.name }}.zip" -Force
+          # Create archive at build\opus-<safe-name>.zip
+          $zip = "${{ steps.names.outputs.zip_file }}"
+          Compress-Archive -Path "artifacts\*" -DestinationPath $zip -Force
 
           # List results for debugging
           Get-ChildItem -Recurse
@@ -91,6 +103,6 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: opus-${{ matrix.config.name }}
-          path: build/opus-${{ matrix.config.name }}.zip
+          name: opus-${{ steps.names.outputs.safe_name }}
+          path: build/${{ steps.names.outputs.zip_file }}
           if-no-files-found: error
