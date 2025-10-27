@@ -24,45 +24,73 @@ jobs:
             build_type: Release,
             shared: OFF
           }
-        - {
-            name: "Windows/Dll/X64/Release",
-            arch: x64,
-            build_type: Release,
-            shared: ON
-          }
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
       - name: Download models
         run: .\autogen.bat
         shell: cmd
+
       - name: Create build directory
         run: mkdir build
         shell: cmd
-      - name: Configure CMake
+
+      - name: Configure CMake (static)
         working-directory: ./build
         run: |
           cmake --version
-          cmake .. -G "Visual Studio 17 2022" -A ${{ matrix.config.arch }} -DBUILD_SHARED_LIBS=${{ matrix.config.shared }} -DOPUS_BUILD_PROGRAMS=ON -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=${{ matrix.config.build_type }}
+          cmake .. -G "Visual Studio 17 2022" ^
+            -A ${{ matrix.config.arch }} ^
+            -DOPUS_BUILD_SHARED_LIBRARY=${{ matrix.config.shared }} ^
+            -DBUILD_SHARED_LIBS=${{ matrix.config.shared }} ^
+            -DOPUS_BUILD_PROGRAMS=ON ^
+            -DOPUS_BUILD_TESTING=ON ^
+            -DBUILD_TESTING=ON ^
+            -DCMAKE_BUILD_TYPE=${{ matrix.config.build_type }}
         shell: cmd
+
       - name: Build
         working-directory: ./build
         run: cmake --build . -j 2 --config ${{ matrix.config.build_type }}
         shell: cmd
+
       - name: Test
         working-directory: ./build
         run: ctest -j 2 -C ${{ matrix.config.build_type }} --output-on-failure
         shell: cmd
-      - name: Package
+
+      # Replace the non-functional "Package" step with explicit packaging
+      - name: Collect and zip artifacts
         working-directory: ./build
-        run: cmake --build . --config ${{ matrix.config.build_type }} --target package
-        shell: cmd
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path artifacts\lib | Out-Null
+          New-Item -ItemType Directory -Force -Path artifacts\include | Out-Null
+
+          # Copy static library (built with Visual Studio generator)
+          Copy-Item -Path "${{ matrix.config.build_type }}\opus*.lib" -Destination artifacts\lib -ErrorAction Stop
+
+          # Copy public headers from source tree
+          Copy-Item -Path "..\include\*" -Destination artifacts\include -Recurse -Force
+
+          # Add license/readme if desired
+          if (Test-Path ..\COPYING) { Copy-Item ..\COPYING artifacts\ -Force }
+          if (Test-Path ..\README.md) { Copy-Item ..\README.md artifacts\ -Force }
+
+          # Create archive at build\opus-<name>.zip
+          Compress-Archive -Path "artifacts\*" -DestinationPath "opus-${{ matrix.config.name }}.zip" -Force
+
+          # List results for debugging
+          Get-ChildItem -Recurse
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: opus-${{ matrix.config.name }}
-          path: build/*.zip
-          if-no-files-found: ignore
+          path: build/opus-${{ matrix.config.name }}.zip
+          if-no-files-found: error
