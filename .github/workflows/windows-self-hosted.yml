@@ -2,13 +2,38 @@ name: Windows Self-Hosted Build
 
 on:
   workflow_dispatch:
+    inputs:
+      publish_release:
+        description: "Publish a GitHub Release with the packaged artifact"
+        type: boolean
+        default: false
+      release_tag:
+        description: "Tag name to use for the Release (only when publishing via workflow_dispatch)"
+        type: string
+        required: false
+        default: ""
+      release_name:
+        description: "Release title (optional)"
+        type: string
+        required: false
+        default: ""
+      prerelease:
+        description: "Mark the release as a prerelease (workflow_dispatch only)"
+        type: boolean
+        default: true
+      draft:
+        description: "Create the release as a draft (workflow_dispatch only)"
+        type: boolean
+        default: false
   push:
     branches:
       - main
+    tags:
+      - v*
   pull_request:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   WindowsSelfHostedBuild:
@@ -63,18 +88,48 @@ jobs:
         run: ctest -j 2 -C ${{ matrix.config.build_type }} --output-on-failure
         shell: cmd
 
-      # Compute a safe artifact/zip name (replace / and \ with -)
+      # Compute a safe artifact/zip name (replace / and \ with -) and include tag/branch or manual tag
       - name: Compute artifact names
         id: names
         working-directory: ./build
         shell: pwsh
+        env:
+          INPUT_PUBLISH: ${{ inputs.publish_release }}
+          INPUT_TAG: ${{ inputs.release_tag }}
+          REF_NAME: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           $raw = "${{ matrix.config.name }}"
           $safe = $raw.Replace('/', '-').Replace('\', '-')
-          "safe_name=$safe" >> $env:GITHUB_OUTPUT
-          "zip_file=opus-$safe.zip" >> $env:GITHUB_OUTPUT
 
-      # Collect and zip artifacts with sanitized name
+          $eventName = "${env:EVENT_NAME}"
+          $publishInput = ("${env:INPUT_PUBLISH}" -eq "true") -or ("${env:INPUT_PUBLISH}" -eq "True")
+          $inputTag = "${env:INPUT_TAG}"
+          $refName = "${env:REF_NAME}"
+
+          $doPublish = $false
+          $tag = ""
+          if ($eventName -eq 'workflow_dispatch' -and $publishInput) {
+            $doPublish = $true
+            if ([string]::IsNullOrWhiteSpace($inputTag)) {
+              $tag = "manual-" + (Get-Date -Format 'yyyyMMdd-HHmmss')
+            } else {
+              $tag = $inputTag
+            }
+            $refLabel = $tag
+          }
+          else {
+            $refLabel = $refName
+          }
+
+          $zip = "opus-$safe-$refLabel.zip"
+
+          "safe_name=$safe"        >> $env:GITHUB_OUTPUT
+          "zip_file=$zip"          >> $env:GITHUB_OUTPUT
+          "do_publish=$doPublish"  >> $env:GITHUB_OUTPUT
+          "release_tag=$tag"       >> $env:GITHUB_OUTPUT
+
+      # Collect and zip artifacts
       - name: Collect and zip artifacts
         working-directory: ./build
         shell: pwsh
@@ -93,16 +148,39 @@ jobs:
           if (Test-Path ..\COPYING) { Copy-Item ..\COPYING artifacts\ -Force }
           if (Test-Path ..\README.md) { Copy-Item ..\README.md artifacts\ -Force }
 
-          # Create archive at build\opus-<safe-name>.zip
+          # Create archive
           $zip = "${{ steps.names.outputs.zip_file }}"
           Compress-Archive -Path "artifacts\*" -DestinationPath $zip -Force
 
           # List results for debugging
           Get-ChildItem -Recurse
 
-      - name: Upload artifacts
+      - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: opus-${{ steps.names.outputs.safe_name }}
+          name: opus-${{ steps.names.outputs.safe_name }}-${{ github.ref_name }}
           path: build/${{ steps.names.outputs.zip_file }}
           if-no-files-found: error
+
+      # Publish a GitHub Release with the zip attached when building a tag (e.g., v1.0.0)
+      - name: Create GitHub Release and upload asset (tag push)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/${{ steps.names.outputs.zip_file }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Publish a GitHub Release from workflow_dispatch with a provided (or generated) tag
+      - name: Create GitHub Release and upload asset (manual publish)
+        if: github.event_name == 'workflow_dispatch' && steps.names.outputs.do_publish == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.names.outputs.release_tag }}
+          files: build/${{ steps.names.outputs.zip_file }}
+          generate_release_notes: true
+          prerelease: ${{ inputs.prerelease }}
+          draft: ${{ inputs.draft }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
