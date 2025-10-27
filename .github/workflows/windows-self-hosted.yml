@@ -10,7 +10,7 @@ on:
 jobs:
   WindowsSelfHostedBuild:
     name: Build Opus on Self-Hosted Windows Runner
-    runs-on: self-hosted
+    runs-on: [self-hosted, windows, x64]
     strategy:
       fail-fast: false
       matrix:
