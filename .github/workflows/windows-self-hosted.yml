@@ -88,7 +88,7 @@ jobs:
         run: ctest -j 2 -C ${{ matrix.config.build_type }} --output-on-failure
         shell: cmd
 
-      # Compute a safe artifact/zip name (replace / and \ with -) and include tag/branch or manual tag
+      # Compute safe names and a zip filename that always ends with .zip
       - name: Compute artifact names
         id: names
         working-directory: ./build
@@ -108,26 +108,28 @@ jobs:
           $refName = "${env:REF_NAME}"
 
           $doPublish = $false
-          $tag = ""
+          $releaseTag = ""
           if ($eventName -eq 'workflow_dispatch' -and $publishInput) {
             $doPublish = $true
             if ([string]::IsNullOrWhiteSpace($inputTag)) {
-              $tag = "manual-" + (Get-Date -Format 'yyyyMMdd-HHmmss')
+              $releaseTag = "manual-" + (Get-Date -Format 'yyyyMMdd-HHmmss')
             } else {
-              $tag = $inputTag
+              $releaseTag = $inputTag
             }
-            $refLabel = $tag
-          }
-          else {
-            $refLabel = $refName
+            $label = $releaseTag
+          } else {
+            $label = $refName
           }
 
-          $zip = "opus-$safe-$refLabel.zip"
+          # Make a filesystem-safe label (Windows) for filenames
+          $labelSafe = ($label -replace '[^A-Za-z0-9._-]', '-')
+          $zip = "opus-$safe-$labelSafe.zip"
 
-          "safe_name=$safe"        >> $env:GITHUB_OUTPUT
-          "zip_file=$zip"          >> $env:GITHUB_OUTPUT
-          "do_publish=$doPublish"  >> $env:GITHUB_OUTPUT
-          "release_tag=$tag"       >> $env:GITHUB_OUTPUT
+          "safe_name=$safe"          >> $env:GITHUB_OUTPUT
+          "label_safe=$labelSafe"    >> $env:GITHUB_OUTPUT
+          "zip_file=$zip"            >> $env:GITHUB_OUTPUT
+          "do_publish=$doPublish"    >> $env:GITHUB_OUTPUT
+          "release_tag=$releaseTag"  >> $env:GITHUB_OUTPUT
 
       # Collect and zip artifacts
       - name: Collect and zip artifacts
@@ -144,21 +146,24 @@ jobs:
           # Copy public headers from source tree
           Copy-Item -Path "..\include\*" -Destination artifacts\include -Recurse -Force
 
-          # Add license/readme if desired
+          # Optional: license/readme
           if (Test-Path ..\COPYING) { Copy-Item ..\COPYING artifacts\ -Force }
           if (Test-Path ..\README.md) { Copy-Item ..\README.md artifacts\ -Force }
 
-          # Create archive
+          # Ensure .zip suffix and parent dir exist
           $zip = "${{ steps.names.outputs.zip_file }}"
+          if ([System.IO.Path]::GetExtension($zip) -ne '.zip') { $zip = "$zip.zip" }
+          $parent = Split-Path -Parent $zip
+          if ($parent) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
+
           Compress-Archive -Path "artifacts\*" -DestinationPath $zip -Force
 
-          # List results for debugging
           Get-ChildItem -Recurse
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: opus-${{ steps.names.outputs.safe_name }}-${{ github.ref_name }}
+          name: opus-${{ steps.names.outputs.safe_name }}-${{ steps.names.outputs.label_safe }}
           path: build/${{ steps.names.outputs.zip_file }}
           if-no-files-found: error
 
@@ -178,6 +183,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.names.outputs.release_tag }}
+          name: ${{ inputs.release_name }}
           files: build/${{ steps.names.outputs.zip_file }}
           generate_release_notes: true
           prerelease: ${{ inputs.prerelease }}
